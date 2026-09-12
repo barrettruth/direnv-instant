@@ -26,7 +26,18 @@ pub fn run() {
     let direnv = "direnv";
 
     // Find .envrc directory
-    let envrc_dir = match find_envrc() {
+    let envrc_dir = find_envrc();
+
+    // Check if we need to restart daemon (different directory)
+    if let Ok(current) = env::var("__DIRENV_INSTANT_CURRENT_DIR") {
+        let current_dir = PathBuf::from(&current);
+        if envrc_dir.as_ref() != Some(&current_dir) {
+            // Detach rather than force-stop: other shells in the old
+            // directory may still be waiting on that daemon.
+            detach_daemon(&get_socket_path(&current_dir), parent_pid);
+        }
+    }
+    let envrc_dir = match envrc_dir {
         Some(dir) => dir,
         None => {
             shell.unset_var("__DIRENV_INSTANT_CURRENT_DIR");
@@ -34,16 +45,6 @@ pub fn run() {
             return;
         }
     };
-
-    // Check if we need to restart daemon (different directory)
-    if let Ok(current) = env::var("__DIRENV_INSTANT_CURRENT_DIR") {
-        let current_dir = PathBuf::from(&current);
-        if current_dir != envrc_dir {
-            // Detach rather than force-stop: other shells in the old
-            // directory may still be waiting on that daemon.
-            detach_daemon(&get_socket_path(&current_dir), parent_pid);
-        }
-    }
     shell.export_var(
         "__DIRENV_INSTANT_CURRENT_DIR",
         &envrc_dir.display().to_string(),
@@ -94,6 +95,11 @@ fn find_envrc() -> Option<PathBuf> {
 }
 
 fn run_direnv_sync(direnv: &str, shell: Shell, show_errors: bool) {
+    for key in ["__DIRENV_INSTANT_ENV_FILE", "__DIRENV_INSTANT_STDERR_FILE"] {
+        if env::var_os(key).is_some() {
+            shell.unset_var(key);
+        }
+    }
     let mut cmd = direnv_export_command(direnv, shell);
     if !show_errors {
         cmd.stderr(Stdio::null());

@@ -5,7 +5,7 @@ use nix::sys::select::{FdSet, select};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use nix::sys::time::{TimeVal, TimeValLike};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, read, setsid};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
@@ -35,6 +35,9 @@ const PTY_WINSIZE: Winsize = Winsize {
 pub fn get_runtime_dir(envrc_dir: &Path) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     envrc_dir.hash(&mut hasher);
+    if env::var("DIRENV_INSTANT_NVIM").as_deref() == Ok("1") {
+        env::var("NVIM").ok().hash(&mut hasher);
+    }
     let dir_hash = hasher.finish();
 
     let cache_base = env::var("XDG_CACHE_HOME")
@@ -73,6 +76,7 @@ fn create_temp_file(runtime_dir: &Path, prefix: &str) -> std::io::Result<PathBuf
 
 pub struct DaemonContext {
     pub parent_pid: i32,
+    pub envrc_dir: PathBuf,
     pub runtime_dir: PathBuf,
     pub socket_path: PathBuf,
     pub env_file: PathBuf,
@@ -94,6 +98,7 @@ impl DaemonContext {
 
         Ok(Self {
             parent_pid,
+            envrc_dir,
             socket_path: runtime_dir.join("daemon.sock"),
             env_file: runtime_dir.join("env"),
             stderr_file: runtime_dir.join("env.stderr"),
@@ -207,61 +212,68 @@ fn handle_socket_commands(
     pty_master: Arc<Mutex<Option<OwnedFd>>>,
 ) {
     for stream in listener.incoming().flatten() {
-        let mut reader = BufReader::new(&stream);
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_ok() {
-            if let Some(stripped) = line.strip_prefix("NOTIFY ") {
-                if let Ok(pid) = stripped.trim().parse::<i32>() {
-                    let mut pids = notify_pids.lock().expect("Failed to lock");
-                    if !pids.contains(&pid) {
-                        pids.push(pid);
+        let notify_pids = notify_pids.clone();
+        let should_stop = should_stop.clone();
+        let pty_master = pty_master.clone();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() {
+                if let Some(stripped) = line.strip_prefix("NOTIFY ") {
+                    if let Ok(pid) = stripped.trim().parse::<i32>() {
+                        let mut pids = notify_pids.lock().expect("Failed to lock");
+                        if !pids.contains(&pid) {
+                            pids.push(pid);
+                        }
                     }
-                }
-            } else if let Some(stripped) = line.strip_prefix("STOP ") {
-                // Pid-scoped stop: ignore pids we never registered, shut
-                // down when the last registered shell detaches.
-                if let Ok(pid) = stripped.trim().parse::<i32>() {
-                    let mut pids = notify_pids.lock().expect("Failed to lock");
-                    if let Some(i) = pids.iter().position(|p| *p == pid) {
-                        pids.remove(i);
-                        if pids.is_empty() {
-                            should_stop.store(true, Ordering::Relaxed);
-                            break;
+                } else if let Some(stripped) = line.strip_prefix("STOP ") {
+                    // Pid-scoped stop: ignore pids we never registered, shut
+                    // down when the last registered shell detaches.
+                    if let Ok(pid) = stripped.trim().parse::<i32>() {
+                        let mut pids = notify_pids.lock().expect("Failed to lock");
+                        if let Some(i) = pids.iter().position(|p| *p == pid) {
+                            pids.remove(i);
+                            if pids.is_empty() {
+                                should_stop.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                } else if line.starts_with("STOP") {
+                    should_stop.store(true, Ordering::Relaxed);
+                } else if line.starts_with("WATCH") {
+                    // Send PTY master fd to watch command via SCM_RIGHTS
+                    if let Some(ref owned_fd) = *pty_master.lock().expect("Failed to lock") {
+                        let iov = [IoSlice::new(b"OK\n")];
+                        let fds = [owned_fd.as_raw_fd()];
+                        let cmsg = ControlMessage::ScmRights(&fds);
+                        if let Err(e) = sendmsg::<()>(
+                            stream.as_raw_fd(),
+                            &iov,
+                            &[cmsg],
+                            MsgFlags::empty(),
+                            None,
+                        ) {
+                            eprintln!(
+                                "direnv-instant: Failed to send PTY fd to WATCH client: {}",
+                                e
+                            );
+                        }
+                    } else {
+                        // PTY master not available, send error response
+                        eprintln!("direnv-instant: WATCH requested but PTY master not available");
+                        let iov = [IoSlice::new(b"ERR\n")];
+                        if let Err(e) =
+                            sendmsg::<()>(stream.as_raw_fd(), &iov, &[], MsgFlags::empty(), None)
+                        {
+                            eprintln!(
+                                "direnv-instant: Failed to send error response to WATCH client: {}",
+                                e
+                            );
                         }
                     }
                 }
-            } else if line.starts_with("STOP") {
-                should_stop.store(true, Ordering::Relaxed);
-                break;
-            } else if line.starts_with("WATCH") {
-                // Send PTY master fd to watch command via SCM_RIGHTS
-                if let Some(ref owned_fd) = *pty_master.lock().expect("Failed to lock") {
-                    let iov = [IoSlice::new(b"OK\n")];
-                    let fds = [owned_fd.as_raw_fd()];
-                    let cmsg = ControlMessage::ScmRights(&fds);
-                    if let Err(e) =
-                        sendmsg::<()>(stream.as_raw_fd(), &iov, &[cmsg], MsgFlags::empty(), None)
-                    {
-                        eprintln!(
-                            "direnv-instant: Failed to send PTY fd to WATCH client: {}",
-                            e
-                        );
-                    }
-                } else {
-                    // PTY master not available, send error response
-                    eprintln!("direnv-instant: WATCH requested but PTY master not available");
-                    let iov = [IoSlice::new(b"ERR\n")];
-                    if let Err(e) =
-                        sendmsg::<()>(stream.as_raw_fd(), &iov, &[], MsgFlags::empty(), None)
-                    {
-                        eprintln!(
-                            "direnv-instant: Failed to send error response to WATCH client: {}",
-                            e
-                        );
-                    }
-                }
             }
-        }
+        });
     }
 }
 
@@ -409,13 +421,24 @@ fn parent_process(
     let completed = copy_pty_to_logfile(&master, &mut log_file, &should_stop, ctx);
     if !completed {
         let _ = kill(child, Signal::SIGTERM);
+        let _ = mux::finish_nvim(ctx, "cancel", 143);
         return;
     }
 
-    let success = matches!(
-        waitpid(child, Some(WaitPidFlag::empty())),
-        Ok(WaitStatus::Exited(_, 0))
-    );
+    let code = match waitpid(child, None) {
+        Ok(WaitStatus::Exited(_, code)) => code,
+        Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
+        _ => 1,
+    };
+    let success = code == 0;
+    let status = if success {
+        "success"
+    } else if code == 130 {
+        "cancel"
+    } else {
+        "failed"
+    };
+    let _ = mux::finish_nvim(ctx, status, code);
 
     // Check if stderr file has actual content (not just empty file we created)
     let has_stderr = ctx
@@ -429,15 +452,16 @@ fn parent_process(
     }
     // Otherwise Cleanup Drop will remove it
 
-    // Only rename env file on success and if it has content
-    let has_env = success
-        && ctx
-            .temp_file
-            .metadata()
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
+    // Publish emitted environment changes, including failure rollbacks.
+    let has_env = ctx
+        .temp_file
+        .metadata()
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
     if has_env {
         let _ = std::fs::rename(&ctx.temp_file, &ctx.env_file);
+    } else if !success {
+        let _ = remove_file(&ctx.env_file);
     }
     // Otherwise Cleanup Drop will remove it
 

@@ -12,6 +12,8 @@ use crate::daemon::DaemonContext;
 const PANE_HEIGHT: &str = "10";
 const KITTY_VAR: &str = "KITTY_LISTEN_ON";
 const KITTY_LAUNCH_ARGS_VAR: &str = "DIRENV_INSTANT_KITTY_LAUNCH_ARGS";
+const NVIM_VAR: &str = "NVIM";
+const NVIM_MUX_VAR: &str = "DIRENV_INSTANT_NVIM";
 const DEFAULT_KITTY_LAUNCH_ARGS: [&str; 4] = ["--location", "vsplit", "--keep-focus", "--self"];
 
 #[non_exhaustive]
@@ -22,10 +24,15 @@ pub enum Multiplexer {
     Wezterm,
     Kitty,
     Herdr,
+    Nvim,
 }
 
 impl Multiplexer {
     pub fn detect() -> Option<Self> {
+        if env::var(NVIM_MUX_VAR).is_ok_and(|x| x == "1") && env::var(NVIM_VAR).is_ok() {
+            return Some(Self::Nvim);
+        }
+
         if env::var("TMUX").is_ok() {
             return Some(Self::Tmux);
         }
@@ -60,6 +67,7 @@ impl Multiplexer {
 
         match self {
             Multiplexer::Herdr => return spawn_herdr(&bin, ctx),
+            Multiplexer::Nvim => return spawn_nvim(&bin, ctx),
             Multiplexer::Tmux => {
                 command = Command::new("tmux");
                 command.args(["split-window", "-d", "-l", PANE_HEIGHT]);
@@ -186,6 +194,92 @@ fn parse_pane_id(json: &str) -> Option<String> {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn spawn_nvim(bin: &str, ctx: &DaemonContext) -> io::Result<()> {
+    let lua = format!(
+        r#"require("mux.direnv").watch({{bin="{}", log="{}", socket="{}", shell_pid={}, target="{}"}})"#,
+        escape_lua_string(bin),
+        escape_lua_string(&ctx.temp_stderr.to_string_lossy()),
+        escape_lua_string(&ctx.socket_path.to_string_lossy()),
+        ctx.parent_pid,
+        escape_lua_string(&ctx.envrc_dir.to_string_lossy()),
+    );
+    nvim_remote(&lua)
+}
+
+fn nvim_remote(lua: &str) -> io::Result<()> {
+    let socket = env::var(NVIM_VAR).map_err(|e| Error::other(e.to_string()))?;
+    let expr = format!("luaeval('{}')", escape_vim_single_string(lua));
+    let mut child = Command::new("nvim")
+        .args(["--server", &socket, "--remote-expr", &expr])
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+pub fn finish_nvim(ctx: &DaemonContext, status: &str, code: i32) -> io::Result<()> {
+    if !matches!(ctx.multiplexer, Some(Multiplexer::Nvim)) {
+        return Ok(());
+    }
+    let socket = env::var(NVIM_VAR).map_err(Error::other)?;
+    let lua = format!(
+        r#"require("mux.direnv").finish_watch({{log="{}", socket="{}", shell_pid={}, target="{}", status="{}", code={}}})"#,
+        escape_lua_string(&ctx.temp_stderr.to_string_lossy()),
+        escape_lua_string(&ctx.socket_path.to_string_lossy()),
+        ctx.parent_pid,
+        escape_lua_string(&ctx.envrc_dir.to_string_lossy()),
+        status,
+        code,
+    );
+    let expr = format!("luaeval('{}')", escape_vim_single_string(&lua));
+    let mut child = Command::new("nvim")
+        .args(["--server", &socket, "--remote-expr", &expr])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(result) = child.try_wait()? {
+            return if result.success() {
+                Ok(())
+            } else {
+                Err(Error::other("Neovim rejected direnv completion"))
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::new(
+                io::ErrorKind::TimedOut,
+                "Neovim completion timed out",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn escape_lua_string(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_ascii_control() => escaped.push_str(&format!("\\{:03}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+fn escape_vim_single_string(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 fn kitty_launch_args() -> Vec<String> {

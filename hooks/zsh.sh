@@ -6,6 +6,11 @@
 # Global state variables
 typeset -g __DIRENV_INSTANT_ENV_FILE=""
 typeset -g __DIRENV_INSTANT_STDERR_FILE=""
+zmodload zsh/system
+if (( ! ${+__DIRENV_INSTANT_OWNER_PID} )); then
+  typeset -gr __DIRENV_INSTANT_OWNER_PID=$sysparams[pid]
+fi
+typeset -g __DIRENV_INSTANT_USE_CACHE=${DIRENV_INSTANT_USE_CACHE:-1}
 
 # Save existing TRAPUSR1 handler if another plugin defined one
 if (( $+functions[TRAPUSR1] )); then
@@ -32,6 +37,14 @@ TRAPUSR1() {
     eval "$(<"$__DIRENV_INSTANT_ENV_FILE")"
   fi
 
+  export DIRENV_INSTANT_SHELL_PID=$__DIRENV_INSTANT_OWNER_PID
+  export DIRENV_INSTANT_USE_CACHE=$__DIRENV_INSTANT_USE_CACHE
+
+  if [[ ${DIRENV_INSTANT_NVIM:-} == 1 ]] && [[ -n ${NVIM:-} ]]; then
+    command nvim --server "$NVIM" \
+      --remote-expr 'luaeval("require([[mux.direnv]]).refresh()")' >/dev/null 2>&1 &!
+  fi
+
   # Chain to previous handler if one existed
   (( $+functions[__direnv_instant_orig_TRAPUSR1] )) && __direnv_instant_orig_TRAPUSR1 "$@"
 
@@ -42,12 +55,15 @@ TRAPUSR1() {
 
 # Main hook called on directory changes and prompts
 _direnv_hook() {
-  export DIRENV_INSTANT_SHELL_PID=$$
+  __DIRENV_INSTANT_USE_CACHE=${DIRENV_INSTANT_USE_CACHE:-1}
 
   # Load cached environment immediately if available and caching is enabled
-  if [[ ${DIRENV_INSTANT_USE_CACHE:-1} == 1 ]] && [[ -n $__DIRENV_INSTANT_ENV_FILE ]] && [[ -f $__DIRENV_INSTANT_ENV_FILE ]]; then
+  if [[ $__DIRENV_INSTANT_USE_CACHE == 1 ]] && [[ -n $__DIRENV_INSTANT_ENV_FILE ]] && [[ -f $__DIRENV_INSTANT_ENV_FILE ]]; then
     eval "$(<"$__DIRENV_INSTANT_ENV_FILE")"
   fi
+
+  export DIRENV_INSTANT_SHELL_PID=$__DIRENV_INSTANT_OWNER_PID
+  export DIRENV_INSTANT_USE_CACHE=$__DIRENV_INSTANT_USE_CACHE
 
   trap -- '' SIGINT
   eval "$(direnv-instant start)"
@@ -56,6 +72,7 @@ _direnv_hook() {
 
 # Cleanup on shell exit
 _direnv_exit_cleanup() {
+  [[ $sysparams[pid] == $__DIRENV_INSTANT_OWNER_PID ]] || return 0
   direnv-instant stop
 }
 
