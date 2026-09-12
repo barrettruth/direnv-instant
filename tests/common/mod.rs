@@ -152,8 +152,12 @@ impl Sandbox {
     /// Drop a stub `tmux` script into the sandbox dir. Callers must add
     /// `self.dir` to PATH so it shadows the real one.
     pub fn write_stub_tmux(&self, body: &str) -> io::Result<PathBuf> {
+        self.write_stub("tmux", body)
+    }
+
+    pub fn write_stub(&self, name: &str, body: &str) -> io::Result<PathBuf> {
         let bash = which("bash").expect("bash on PATH");
-        let path = self.dir.join("tmux");
+        let path = self.dir.join(name);
         fs::write(&path, format!("#!{}\n{}\n", bash.display(), body))?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(path)

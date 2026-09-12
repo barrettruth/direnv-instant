@@ -35,8 +35,9 @@ const PTY_WINSIZE: Winsize = Winsize {
 pub fn get_runtime_dir(envrc_dir: &Path) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     envrc_dir.hash(&mut hasher);
-    if env::var("DIRENV_INSTANT_NVIM").as_deref() == Ok("1") {
-        env::var("NVIM").ok().hash(&mut hasher);
+    let session = mux::session_key();
+    if session.is_some() {
+        session.hash(&mut hasher);
     }
     let dir_hash = hasher.finish();
 
@@ -72,6 +73,12 @@ fn create_temp_file(runtime_dir: &Path, prefix: &str) -> std::io::Result<PathBuf
 
     bytes.pop(); // remove null terminator
     Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadOutcome {
+    Exited(i32),
+    Cancelled,
 }
 
 pub struct DaemonContext {
@@ -418,27 +425,24 @@ fn parent_process(
         }
     };
 
-    let completed = copy_pty_to_logfile(&master, &mut log_file, &should_stop, ctx);
-    if !completed {
+    let outcome = if copy_pty_to_logfile(&master, &mut log_file, &should_stop, ctx) {
+        LoadOutcome::Exited(match waitpid(child, None) {
+            Ok(WaitStatus::Exited(_, code)) => code,
+            Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
+            _ => 1,
+        })
+    } else {
         let _ = kill(child, Signal::SIGTERM);
-        let _ = mux::finish_nvim(ctx, "cancel", 143);
+        LoadOutcome::Cancelled
+    };
+    if let Some(multiplexer) = ctx.multiplexer
+        && let Err(err) = multiplexer.finish(ctx, outcome)
+    {
+        eprintln!("direnv-instant: Failed to report load completion: {err}");
+    }
+    if outcome == LoadOutcome::Cancelled {
         return;
     }
-
-    let code = match waitpid(child, None) {
-        Ok(WaitStatus::Exited(_, code)) => code,
-        Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
-        _ => 1,
-    };
-    let success = code == 0;
-    let status = if success {
-        "success"
-    } else if code == 130 {
-        "cancel"
-    } else {
-        "failed"
-    };
-    let _ = mux::finish_nvim(ctx, status, code);
 
     // Check if stderr file has actual content (not just empty file we created)
     let has_stderr = ctx
@@ -460,7 +464,7 @@ fn parent_process(
         .unwrap_or(false);
     if has_env {
         let _ = std::fs::rename(&ctx.temp_file, &ctx.env_file);
-    } else if !success {
+    } else if outcome != LoadOutcome::Exited(0) {
         let _ = remove_file(&ctx.env_file);
     }
     // Otherwise Cleanup Drop will remove it
