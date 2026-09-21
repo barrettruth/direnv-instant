@@ -214,6 +214,7 @@ impl TmuxServer {
         if let Some((x, y)) = size {
             cmd.args(["-x", &x.to_string(), "-y", &y.to_string()]);
         }
+        cmd.args(["sleep", "3600"]);
         let out = cmd.output()?;
         assert!(
             out.status.success(),
