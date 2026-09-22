@@ -35,7 +35,7 @@ Remove any `eval "$(direnv hook ...)"` lines from your shell config first.
 
 ```nix
 {
-  inputs.direnv-instant.url = "github:Mic92/direnv-instant";
+  inputs.direnv-instant.url = "git+https://forge.barrettruth.com/barrettruth/direnv-instant.git";
 }
 ```
 
@@ -91,7 +91,8 @@ can't trap SIGUSR1, so the hook polls the env file on each prompt — new env
 shows up on the next prompt after direnv finishes.
 
 For a quick test without installing, swap `direnv-instant` for
-`nix run github:Mic92/direnv-instant --` in the lines above.
+`nix run git+https://forge.barrettruth.com/barrettruth/direnv-instant.git --`
+in the lines above.
 
 ### From source
 

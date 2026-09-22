@@ -119,7 +119,7 @@ ruff check tests/
 
 1. **Fork and clone the repository**
    ```bash
-   git clone https://github.com/your-username/direnv-instant.git
+   git clone https://forge.barrettruth.com/barrettruth/direnv-instant.git
    cd direnv-instant
    ```
 
@@ -191,7 +191,7 @@ export TMPDIR=/tmp
 
 ## Questions or Need Help?
 
-- Open an issue on GitHub for bugs or feature requests
+- Open an issue on Forgejo for bugs or feature requests
 - Check existing issues and pull requests for similar discussions
 - For security issues, please report privately to the maintainers
 
