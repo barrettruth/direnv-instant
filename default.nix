@@ -45,7 +45,7 @@ rustPlatform.buildRustPackage {
 
   meta = with lib; {
     description = "Non-blocking direnv integration daemon with tmux support";
-    license = licenses.mit;
+    license = licenses.gpl3Only;
     mainProgram = "direnv-instant";
   };
 }

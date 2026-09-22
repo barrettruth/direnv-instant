@@ -197,4 +197,4 @@ export TMPDIR=/tmp
 
 ## License
 
-By contributing to direnv-instant, you agree that your contributions will be licensed under the MIT License.
+By contributing to direnv-instant, you agree that your contributions will be licensed under GPL-3.0.

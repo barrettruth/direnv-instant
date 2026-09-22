@@ -135,4 +135,4 @@ also works with any direnv `.envrc`, not just Nix shells.
 
 ## License
 
-MIT
+GPL-3.0
