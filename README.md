@@ -3,7 +3,7 @@
 Non-blocking direnv shell integration. Runs direnv in a background daemon so
 your prompt comes back immediately instead of waiting for `.envrc` to finish.
 
-![Demo](https://github.com/Mic92/direnv-instant/releases/download/assets/demo.gif)
+![Demo](https://forge.barrettruth.com/attachments/cb4c93e2-4e84-417b-baea-42ede037ba46)
 
 ## What it does
 
